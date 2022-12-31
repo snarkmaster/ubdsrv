@@ -6,6 +6,9 @@
 #include <sys/epoll.h>
 #include "ublksrv_tgt.h"
 
+static __u64 magic_sectors_start = 0;
+static __u64 magic_sectors_count = 0;  // signals "uninitialized" per assertion below
+
 static bool backing_supports_discard(char *name)
 {
 	int fd;
@@ -96,9 +99,13 @@ static int loop_init_tgt(struct ublksrv_dev *dev, int type, int argc, char
 	struct ublksrv_tgt_info *tgt = &dev->tgt;
 	const struct ublksrv_ctrl_dev_info *info =
 		ublksrv_ctrl_get_dev_info(ublksrv_get_ctrl_dev(dev));
+	const int MAGIC_SECTORS_START = 1338;
+	const int MAGIC_SECTORS_COUNT = 1339;
 	static const struct option lo_longopts[] = {
 		{ "file",		1,	NULL, 'f' },
 		{ "buffered_io",	no_argument, &buffered_io, 1},
+		{ "magic_sectors_start", required_argument, NULL, MAGIC_SECTORS_START},
+		{ "magic_sectors_count", required_argument, NULL, MAGIC_SECTORS_COUNT},
 		{ NULL }
 	};
 	unsigned long long bytes;
@@ -137,6 +144,12 @@ static int loop_init_tgt(struct ublksrv_dev *dev, int type, int argc, char
 		switch (opt) {
 		case 'f':
 			file = strdup(optarg);
+			break;
+		case MAGIC_SECTORS_START:
+			magic_sectors_start = strtoull(optarg, NULL, 0);
+			break;
+		case MAGIC_SECTORS_COUNT:
+			magic_sectors_count = strtoull(optarg, NULL, 0);
 			break;
 		}
 	}
@@ -254,9 +267,9 @@ static int loop_queue_tgt_io(const struct ublksrv_queue *q,
 		const struct ublk_io_data *data, int tag)
 {
 	const struct ublksrv_io_desc *iod = data->iod;
-	struct io_uring_sqe *sqe = io_uring_get_sqe(q->ring_ptr);
 	unsigned ublk_op = ublksrv_get_op(iod);
-
+	
+	struct io_uring_sqe *sqe = io_uring_get_sqe(q->ring_ptr);
 	if (!sqe)
 		return 0;
 
@@ -310,6 +323,41 @@ static int loop_queue_tgt_io(const struct ublksrv_queue *q,
 static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 		const struct ublk_io_data *data, int tag)
 {
+	ublk_assert(magic_sectors_count);
+	
+	const struct ublksrv_io_desc *iod = data->iod;
+	if (
+		ublksrv_get_op(iod) == UBLK_IO_OP_READ
+		// Requested range overlaps with the magic range
+		&& !(
+			iod->start_sector >= (magic_sectors_start + magic_sectors_count)
+			|| (iod->start_sector + iod->nr_sectors) <= magic_sectors_start
+		)
+	) {
+		/*
+		syslog(
+			LOG_ERR, 
+			"%s: XXX read %llu %u intersects with magic range\n",
+			__func__, iod->start_sector, iod->nr_sectors
+		);
+		*/
+		if (!(
+			iod->start_sector >= magic_sectors_start
+			&& (iod->start_sector + iod->nr_sectors)
+				<= (magic_sectors_start + magic_sectors_count)
+		)) {
+			syslog(
+				LOG_ERR, 
+				"%s: read %llu %u must fall completely in magic range\n",
+				__func__, iod->start_sector, iod->nr_sectors
+			);
+		} else {
+			memset((void *)iod->addr, 'a', data->iod->nr_sectors << 9);
+		}
+		ublksrv_complete_io(q, tag, data->iod->nr_sectors << 9);
+		co_return;
+	}
+
 	int ret;
 	struct ublk_io_tgt *io = __ublk_get_io_tgt_data(data);
 
